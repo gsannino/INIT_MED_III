@@ -838,6 +838,34 @@ def apply_target_masks(
     return masked
 
 
+def apply_2d_mask_safe(
+    da: xr.DataArray,
+    mask_2d: xr.DataArray,
+    y_dim: str,
+    x_dim: str,
+) -> xr.DataArray:
+    """
+    Apply a 2D mask to a DataArray using NumPy broadcasting to avoid xarray alignment.
+    """
+    if y_dim not in da.dims or x_dim not in da.dims:
+        raise ValueError(f"Data dims {da.dims} missing required dims {(y_dim, x_dim)}.")
+    if y_dim not in mask_2d.dims or x_dim not in mask_2d.dims:
+        raise ValueError(f"Mask dims {mask_2d.dims} missing required dims {(y_dim, x_dim)}.")
+
+    original_dims = list(da.dims)
+    target_dims = [d for d in original_dims if d not in (y_dim, x_dim)] + [y_dim, x_dim]
+    da_t = da.transpose(*target_dims)
+    mask_t = mask_2d.transpose(y_dim, x_dim)
+
+    data = np.asarray(da_t.data)
+    mask = np.asarray(mask_t.data).astype(bool)
+    masked = np.where(mask, data, np.nan)
+
+    coords = {d: da_t.coords[d].values for d in da_t.dims if d in da_t.coords}
+    out = xr.DataArray(masked, dims=da_t.dims, coords=coords, name=da.name, attrs=dict(da.attrs))
+    return out.transpose(*original_dims)
+
+
 def write_netcdf(
     out_path: str,
     varname: str,
@@ -1099,8 +1127,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Apply 2D destination mask immediately (surface wet points), to reduce coastal artifacts early
         LOG.info("Applying 2D destination ocean mask after horizontal regrid")
         mask_dst_2d = (HFacC.isel({grid_meta.z_dim: 0}) > 0.0).transpose(grid_meta.y_dim, grid_meta.x_dim)
-        # Apply by position to avoid coordinate reindexing mismatches (lat/lon vs. index coords).
-        so_h = so_h.where(mask_dst_2d.data)
+        # Apply by position with NumPy broadcasting to avoid coordinate reindexing mismatches.
+        so_h = apply_2d_mask_safe(so_h, mask_dst_2d, grid_meta.y_dim, grid_meta.x_dim)
 
         # Vertical interpolation: source depth -> target depth (Z)
         LOG.info("Vertical interpolation (depth -> RC)")
