@@ -31,7 +31,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -663,6 +663,7 @@ def write_netcdf(
     time_value: Any,
     ds_grid: xr.Dataset,
     grid_meta: GridMeta,
+    depth_tgt: xr.DataArray,
     units: str,
     standard_name: str,
     long_name: str,
@@ -685,10 +686,9 @@ def write_netcdf(
     out[grid_meta.rc_name] = ds_grid[grid_meta.rc_name]
 
     # Provide positive-down depth coordinate too (useful in post-processing)
-    depth_tgt = (-ds_grid[grid_meta.rc_name]).astype("float64")
-    depth_tgt.name = "depth"
-    depth_tgt.attrs = {"long_name": "Depth", "units": "m", "positive": "down", "standard_name": "depth"}
-    out["depth"] = depth_tgt
+    depth_pos = depth_tgt.astype("float64").rename("depth")
+    depth_pos.attrs = {"long_name": "Depth", "units": "m", "positive": "down", "standard_name": "depth"}
+    out["depth"] = depth_pos
 
     # Add the variable
     v = da.astype("float32", copy=False).expand_dims(time=("time",))
@@ -704,7 +704,7 @@ def write_netcdf(
     # Minimal global attributes
     out.attrs = {
         "title": "CMEMS -> MITgcm regridded salinity (single time slice)",
-        "history": f"Created {datetime.utcnow().isoformat()}Z by cmems2mitgcm_so",
+        "history": f"Created {datetime.now(timezone.utc).isoformat()} by cmems2mitgcm_so",
         "Conventions": "CF-1.8",
     }
 
@@ -860,8 +860,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
         # MITgcm target depth: positive down
-        depth_tgt = (-RC).astype("float64")
-        depth_tgt.name = "Z"
+        depth_tgt = _derive_target_depth(RC)
+        _validate_depth_overlap(depth_src, depth_tgt)
 
         # Weights reuse logic
         reuse_weights = bool(args.reuse_weights and os.path.exists(args.weights))
@@ -920,6 +920,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             time_value=tval,
             ds_grid=ds_grid,
             grid_meta=grid_meta,
+            depth_tgt=depth_tgt,
             units=src_units,
             standard_name=std_name,
             long_name=long_name,
