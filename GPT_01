@@ -232,8 +232,12 @@ def _maybe_sort_1d_axis(ds: xr.Dataset, dim: str, coord_name: str) -> xr.Dataset
         return ds
     if np.all(np.diff(vals) > 0):
         return ds
-    # sort increasing
-    return ds.sortby(coord_name)
+    if np.all(np.diff(vals) < 0):
+        return ds.sortby(coord_name)
+    raise ValueError(
+        f"Coordinate '{coord_name}' along dim '{dim}' is not monotonic. "
+        "Please sort or regrid the source dataset before using this tool."
+    )
 
 
 def harmonize_lon_lat_src(
@@ -310,6 +314,54 @@ def select_time_index(
     idx = int(np.argmin(np.abs(tvals - target)))
     tsel = tcoord.isel({meta.time_dim: idx}).values
     return idx, tsel
+
+
+def _ensure_depth_increasing(
+    depth: xr.DataArray,
+    da: xr.DataArray,
+    depth_dim: str,
+) -> Tuple[xr.DataArray, xr.DataArray]:
+    """
+    Ensure depth is strictly increasing (positive-down). If decreasing, reverse depth and data.
+    """
+    if depth.ndim != 1:
+        raise ValueError(f"Source depth '{depth.name}' must be 1D. Got dims {depth.dims}.")
+    depth_vals = np.asarray(depth.values, dtype="float64")
+    if not np.all(np.isfinite(depth_vals)):
+        raise ValueError("Source depth contains non-finite values.")
+    diffs = np.diff(depth_vals)
+    if np.all(diffs > 0):
+        return depth, da
+    if np.all(diffs < 0):
+        LOG.info("Source depth is decreasing; reversing depth axis to be increasing.")
+        depth_rev = depth[::-1]
+        da_rev = da.isel({depth_dim: slice(None, None, -1)})
+        return depth_rev, da_rev
+    raise ValueError("Source depth must be strictly monotonic (increasing or decreasing).")
+
+
+def _standardize_regrid_output(
+    da: xr.DataArray,
+    depth_dim: str,
+    y_dim: str,
+    x_dim: str,
+) -> xr.DataArray:
+    """
+    Ensure regridded output uses expected dim names and ordering (depth, Y, X).
+    """
+    if da.ndim != 3:
+        raise ValueError(f"Unexpected horiz output ndim={da.ndim}, dims={da.dims}. Expected 3D (depth,Y,X).")
+
+    dims = list(da.dims)
+    if depth_dim not in dims:
+        depth_dim = dims[0]
+    if y_dim not in dims or x_dim not in dims:
+        if dims[-2:] != [y_dim, x_dim]:
+            LOG.warning("Regridded dims %s do not match expected (%s,%s); attempting rename by position.",
+                        dims, y_dim, x_dim)
+        da = da.rename({dims[-2]: y_dim, dims[-1]: x_dim})
+    da = da.rename({dims[0]: depth_dim})
+    return da.transpose(depth_dim, y_dim, x_dim)
 
 
 def load_source(
@@ -798,14 +850,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
         # Ensure depth is positive-down and increasing
-        depth_src = ds_src[src_meta.depth_name]
-        if depth_src.ndim != 1:
-            raise ValueError(f"Source depth '{src_meta.depth_name}' must be 1D. Got dims {depth_src.dims}.")
-        depth_src_v = np.asarray(depth_src.values, dtype="float64")
-        if not np.all(np.isfinite(depth_src_v)):
-            raise ValueError("Source depth contains non-finite values.")
-        if np.any(np.diff(depth_src_v) <= 0):
-            raise ValueError("Source depth must be strictly increasing (positive down).")
+        depth_src, da_src = _ensure_depth_increasing(
+            ds_src[src_meta.depth_name],
+            da_src,
+            src_meta.depth_dim,
+        )
 
         # MITgcm target depth: positive down
         depth_tgt = (-RC).astype("float64")
@@ -841,12 +890,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # Vertical interpolation: source depth -> target depth (Z)
         LOG.info("Vertical interpolation (depth -> RC)")
-        # so_h dims should be (depth, Y, X) but dim names may differ; standardize
-        # Identify destination spatial dims from output of xESMF
-        # xESMF uses grid_dst dims ("Y","X") as defined in make_grids_for_xesmf
-        if so_h.ndim != 3:
-            raise ValueError(f"Unexpected horiz output ndim={so_h.ndim}, dims={so_h.dims}. Expected 3D (depth,Y,X).")
-        so_h = so_h.rename({so_h.dims[0]: src_meta.depth_dim, so_h.dims[1]: grid_meta.y_dim, so_h.dims[2]: grid_meta.x_dim})
+        # Standardize output dims to (depth, Y, X)
+        so_h = _standardize_regrid_output(so_h, src_meta.depth_dim, grid_meta.y_dim, grid_meta.x_dim)
         so_v = vert_interp(
             da_in=so_h,
             depth_src=depth_src,
