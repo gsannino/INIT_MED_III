@@ -951,6 +951,7 @@ def write_netcdf(
     }
 
     out.to_netcdf(out_path, encoding=encoding)
+    log_data_range("NetCDF output salinity", out[varname])
     LOG.info("Wrote NetCDF: %s (%.2f s)", out_path, time.perf_counter() - t0)
 
 
