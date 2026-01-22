@@ -420,6 +420,71 @@ def _standardize_regrid_output(
     return da.transpose(depth_dim, y_dim, x_dim)
 
 
+def _apply_missing_value_mask(da: xr.DataArray) -> xr.DataArray:
+    """
+    Mask missing/fill values and obviously invalid ranges using metadata.
+    """
+    attrs = da.attrs or {}
+    missing_candidates = []
+    for key in ("_FillValue", "missing_value"):
+        val = attrs.get(key)
+        if val is not None:
+            missing_candidates.append(val)
+
+    for mv in missing_candidates:
+        try:
+            mv_float = float(mv)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(mv_float):
+            da = da.where(da != mv_float)
+
+    valid_min = attrs.get("valid_min")
+    valid_max = attrs.get("valid_max")
+    valid_range = attrs.get("valid_range")
+
+    try:
+        if valid_range is not None and len(valid_range) == 2:
+            vmin, vmax = (float(valid_range[0]), float(valid_range[1]))
+            da = da.where((da >= vmin) & (da <= vmax))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        if valid_min is not None:
+            da = da.where(da >= float(valid_min))
+        if valid_max is not None:
+            da = da.where(da <= float(valid_max))
+    except (TypeError, ValueError):
+        pass
+
+    # Safety net: mask absurdly large values that often represent missing data.
+    da = da.where(np.abs(da) < 1.0e10)
+    return da
+
+
+def log_data_range(label: str, da: xr.DataArray, mask: Optional[xr.DataArray] = None) -> None:
+    """
+    Log min/max of data excluding NaNs and optional mask.
+    """
+    if mask is not None:
+        da = da.where(mask)
+    da = da.where(np.isfinite(da))
+    min_da = da.min(skipna=True)
+    max_da = da.max(skipna=True)
+    try:
+        min_val = float(min_da.compute().item())
+        max_val = float(max_da.compute().item())
+    except Exception:
+        min_val = float(min_da.item())
+        max_val = float(max_da.item())
+
+    if not np.isfinite(min_val) or not np.isfinite(max_val):
+        LOG.warning("%s: no finite values after masking.", label)
+    else:
+        LOG.info("%s: min=%.6g max=%.6g", label, min_val, max_val)
+
+
 def load_source(
     path: str,
     varname: str,
@@ -442,6 +507,8 @@ def load_source(
     # Keep NaNs as missing; ensure float dtype
     if not np.issubdtype(da.dtype, np.floating):
         da = da.astype("float32")
+
+    da = _apply_missing_value_mask(da)
 
     return ds, da, meta, idx, tsel
 
@@ -766,7 +833,7 @@ def write_netcdf(
 
     # Encoding: keep light compression; set fill value
     encoding: Dict[str, Dict[str, Any]] = {
-        varname: {"zlib": True, "complevel": 1, "_FillValue": np.float32(1.0e20)},
+        varname: {"zlib": True, "complevel": 1, "_FillValue": np.nan},
         "time": {"zlib": False},
     }
 
@@ -915,6 +982,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             src_meta.depth_dim,
         )
 
+        log_data_range("Source data before interpolation", da_src)
+
         # MITgcm target depth: positive down
         depth_tgt = _derive_target_depth(RC)
         _validate_depth_overlap(depth_src, depth_tgt)
@@ -961,6 +1030,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Apply HFacC mask (3D, partial cells)
         LOG.info("Applying HFacC (3D) mask and QC")
         so_masked = apply_target_masks(so_v, HFacC, grid_meta.z_dim, grid_meta.y_dim, grid_meta.x_dim)
+
+        log_data_range("Interpolated data after masking", so_masked, mask=(HFacC > 0.0))
 
         # Prepare attrs
         src_units = str(ds_src[args.var].attrs.get("units", "1e-3"))
