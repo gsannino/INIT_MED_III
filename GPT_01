@@ -951,6 +951,7 @@ def write_netcdf(
     }
 
     out.to_netcdf(out_path, encoding=encoding)
+    log_data_range("NetCDF output salinity", out[varname])
     LOG.info("Wrote NetCDF: %s (%.2f s)", out_path, time.perf_counter() - t0)
 
 
@@ -1147,6 +1148,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         so_masked = apply_target_masks(so_v, HFacC, grid_meta.z_dim, grid_meta.y_dim, grid_meta.x_dim)
 
         log_data_range("Interpolated data after masking", so_masked, mask=(HFacC > 0.0))
+
+        log_data_range("Salinity before NetCDF write", so_masked, mask=(HFacC > 0.0))
 
         
         # Prepare attrs
