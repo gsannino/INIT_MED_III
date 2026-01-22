@@ -470,6 +470,14 @@ def log_data_range(label: str, da: xr.DataArray, mask: Optional[xr.DataArray] = 
     if mask is not None:
         da = da.where(mask)
     da = da.where(np.isfinite(da))
+    count_da = da.count()
+    try:
+        count_val = int(count_da.compute().item())
+    except Exception:
+        count_val = int(count_da.item())
+    if count_val == 0:
+        LOG.warning("%s: no finite values after masking.", label)
+        return
     min_da = da.min(skipna=True)
     max_da = da.max(skipna=True)
     try:
