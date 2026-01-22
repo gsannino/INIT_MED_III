@@ -1148,6 +1148,26 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         log_data_range("Interpolated data after masking", so_masked, mask=(HFacC > 0.0))
 
+        y_index = 50
+        if y_index < so_masked.sizes[grid_meta.y_dim]:
+            so_y = so_masked.isel({grid_meta.y_dim: y_index})
+            so_y_values = so_y.values
+            print(f"Salinity slice at Y={y_index} (dims {so_y.dims}):")
+            print(
+                np.array2string(
+                    so_y_values,
+                    threshold=so_y_values.size,
+                    max_line_width=120,
+                )
+            )
+        else:
+            LOG.warning(
+                "Requested Y index %d is out of range for dimension %s (size=%d).",
+                y_index,
+                grid_meta.y_dim,
+                so_masked.sizes[grid_meta.y_dim],
+            )
+
         # Prepare attrs
         src_units = str(ds_src[args.var].attrs.get("units", "1e-3"))
         std_name = str(ds_src[args.var].attrs.get("standard_name", "sea_water_salinity"))
