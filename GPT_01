@@ -819,25 +819,21 @@ def apply_target_masks(
     if set((z_dim, y_dim, x_dim)) - set(HFacC.dims):
         raise ValueError(f"HFacC dims {HFacC.dims} missing one of required dims {(z_dim, y_dim, x_dim)}.")
 
-    # Align da to (Z,Y,X) and synchronize coords with HFacC to avoid label mismatch.
+    # Align da to (Z,Y,X); mask by position to avoid coordinate-label mismatches.
     da = da.transpose(z_dim, y_dim, x_dim)
-    coords_to_align = {d: HFacC.coords[d] for d in (z_dim, y_dim, x_dim) if d in HFacC.coords}
-    if coords_to_align:
-        da = da.assign_coords(coords_to_align)
+    hfac_mask = (HFacC > 0.0).transpose(z_dim, y_dim, x_dim)
+    masked = da.where(hfac_mask.data)
 
-    hfac_mask = (HFacC > 0.0)
-    masked = da.where(hfac_mask)
-
-    # QC: after masking, no finite values where HFacC==0
-    masked_finite = xr.DataArray(np.isfinite(masked.data), dims=masked.dims)
-    bad = xr.where(~hfac_mask, masked_finite, False).any()
+    # QC: after masking, no finite values where HFacC==0 (position-based).
+    masked_finite = np.isfinite(masked.data)
+    bad = np.any((~hfac_mask.data) & masked_finite)
     try:
         bad_val = bool(bad.compute().item())
     except Exception:
-        bad_val = bool(bad.item())
+        bad_val = bool(bad)
     if bad_val:
         LOG.warning("QC failed: found finite values on land (HFacC==0). Re-applying mask.")
-        masked = masked.where(hfac_mask)
+        masked = masked.where(hfac_mask.data)
 
     return masked
 
