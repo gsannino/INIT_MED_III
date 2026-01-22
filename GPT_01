@@ -204,6 +204,36 @@ def infer_grid_meta(ds: xr.Dataset) -> GridMeta:
     )
 
 
+def find_bathymetry(ds: xr.Dataset, grid_meta: GridMeta) -> Optional[xr.DataArray]:
+    candidates = (
+        "Depth",
+        "depth",
+        "Bathy",
+        "BATHY",
+        "bathy",
+        "Bathymetry",
+        "bathymetry",
+    )
+    name = _first_existing(candidates, ds)
+    if not name:
+        return None
+
+    bathy = ds[name]
+    if bathy.ndim != 2:
+        LOG.warning("Bathymetry variable '%s' is not 2D (dims=%s); skipping.", name, bathy.dims)
+        return None
+    if grid_meta.y_dim not in bathy.dims or grid_meta.x_dim not in bathy.dims:
+        LOG.warning(
+            "Bathymetry variable '%s' dims %s do not include (%s,%s); skipping.",
+            name,
+            bathy.dims,
+            grid_meta.y_dim,
+            grid_meta.x_dim,
+        )
+        return None
+    return bathy.transpose(grid_meta.y_dim, grid_meta.x_dim)
+
+
 def _normalize_lon_range_1d(lon: xr.DataArray, target_is_0360: bool) -> xr.DataArray:
     lonv = lon.astype("float64")
     if target_is_0360:
@@ -631,10 +661,10 @@ def make_grids_for_xesmf(
     )
 
     grid_dst = xr.Dataset(
-        data_vars=dict(mask=(("Y", "X"), mask_dst_i.data)),
+        data_vars=dict(mask=((grid_meta.y_dim, grid_meta.x_dim), mask_dst_i.data)),
         coords=dict(
-            lon=(("Y", "X"), lon2d.data),
-            lat=(("Y", "X"), lat2d.data),
+            lon=((grid_meta.y_dim, grid_meta.x_dim), lon2d.data),
+            lat=((grid_meta.y_dim, grid_meta.x_dim), lat2d.data),
         ),
     )
 
@@ -822,6 +852,17 @@ def write_netcdf(
     out[grid_meta.xc_name] = ds_grid[grid_meta.xc_name]
     out[grid_meta.yc_name] = ds_grid[grid_meta.yc_name]
     out[grid_meta.rc_name] = ds_grid[grid_meta.rc_name]
+
+    bathy = find_bathymetry(ds_grid, grid_meta)
+    if bathy is not None:
+        bathy_out = bathy.astype("float32", copy=False).rename("bathymetry")
+        bathy_out.attrs = {
+            "long_name": "Bathymetry",
+            "units": "m",
+            "positive": "down",
+            "standard_name": "sea_floor_depth_below_geoid",
+        }
+        out["bathymetry"] = bathy_out
 
     # Provide positive-down depth coordinate too (useful in post-processing)
     depth_pos = depth_tgt.astype("float64").rename("depth")
