@@ -787,6 +787,7 @@ def write_netcdf(
     ds_grid: xr.Dataset,
     grid_meta: GridMeta,
     depth_tgt: xr.DataArray,
+    mask_dst_2d: xr.DataArray,
     units: str,
     standard_name: str,
     long_name: str,
@@ -824,6 +825,19 @@ def write_netcdf(
     }
     out[varname] = v
 
+    # Add the land/sea mask used for interpolation (1=ocean, 0=land)
+    mask_out = (
+        mask_dst_2d.transpose(grid_meta.y_dim, grid_meta.x_dim)
+        .astype("int8", copy=False)
+        .rename("land_sea_mask")
+    )
+    mask_out.attrs = {
+        "long_name": "Land/sea mask used for interpolation",
+        "flag_values": [0, 1],
+        "flag_meanings": "land sea",
+    }
+    out["land_sea_mask"] = mask_out
+
     # Minimal global attributes
     out.attrs = {
         "title": "CMEMS -> MITgcm regridded salinity (single time slice)",
@@ -834,6 +848,7 @@ def write_netcdf(
     # Encoding: keep light compression; set fill value
     encoding: Dict[str, Dict[str, Any]] = {
         varname: {"zlib": True, "complevel": 1, "_FillValue": np.nan},
+        "land_sea_mask": {"zlib": True, "complevel": 1, "_FillValue": None},
         "time": {"zlib": False},
     }
 
@@ -1048,6 +1063,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             ds_grid=ds_grid,
             grid_meta=grid_meta,
             depth_tgt=depth_tgt,
+            mask_dst_2d=mask_dst_2d,
             units=src_units,
             standard_name=std_name,
             long_name=long_name,
