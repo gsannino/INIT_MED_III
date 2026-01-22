@@ -1,4 +1,4 @@
-```python
+
 #!/usr/bin/env python3
 """
 CMEMS -> MITgcm salinity (so) regridding for a single time slice.
@@ -362,47 +362,6 @@ def _standardize_regrid_output(
         da = da.rename({dims[-2]: y_dim, dims[-1]: x_dim})
     da = da.rename({dims[0]: depth_dim})
     return da.transpose(depth_dim, y_dim, x_dim)
-
-
-def _derive_target_depth(RC: xr.DataArray) -> xr.DataArray:
-    """
-    Return positive-down depth coordinate derived from RC, handling sign convention.
-    """
-    rc_vals = np.asarray(RC.values, dtype="float64")
-    if not np.all(np.isfinite(rc_vals)):
-        raise ValueError("Target RC contains non-finite values.")
-    if np.all(rc_vals <= 0.0):
-        depth_tgt = (-RC).astype("float64")
-    elif np.all(rc_vals >= 0.0):
-        depth_tgt = RC.astype("float64")
-    else:
-        raise ValueError("Target RC contains mixed sign values; cannot infer depth sign convention.")
-    depth_tgt.name = "Z"
-    return depth_tgt
-
-
-def _validate_depth_overlap(depth_src: xr.DataArray, depth_tgt: xr.DataArray) -> None:
-    """
-    Ensure source and target depth ranges overlap; warn if target exceeds source range.
-    """
-    src_vals = np.asarray(depth_src.values, dtype="float64")
-    tgt_vals = np.asarray(depth_tgt.values, dtype="float64")
-    src_min, src_max = float(np.min(src_vals)), float(np.max(src_vals))
-    tgt_min, tgt_max = float(np.min(tgt_vals)), float(np.max(tgt_vals))
-    if tgt_max < src_min or tgt_min > src_max:
-        raise ValueError(
-            "Target depth range does not overlap source depth range. "
-            f"source=[{src_min:.3f},{src_max:.3f}], target=[{tgt_min:.3f},{tgt_max:.3f}]"
-        )
-    if tgt_min < src_min or tgt_max > src_max:
-        LOG.warning(
-            "Target depth range exceeds source range; out-of-range values will be NaN. "
-            "source=[%.3f, %.3f], target=[%.3f, %.3f]",
-            src_min,
-            src_max,
-            tgt_min,
-            tgt_max,
-        )
 
 
 def load_source(
@@ -988,4 +947,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-```
