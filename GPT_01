@@ -1,0 +1,901 @@
+```python
+#!/usr/bin/env python3
+"""
+CMEMS -> MITgcm salinity (so) regridding for a single time slice.
+
+Reads a CMEMS NetCDF on a regular 1D lat/lon grid with positive-down depth,
+selects ONE time index (or nearest time by ISO date), horizontally regrids to a
+curvilinear MITgcm T-point grid (XC/YC), then vertically interpolates from source
+depth to MITgcm RC (positive-up; typically negative), applying HFacC to enforce
+ocean/land and partial-cell masking.
+
+Outputs:
+  1) CF-compliant NetCDF with dims (time=1, Z, Y, X)
+  2) MITgcm binary float32 big-endian, order i-fast -> j -> k (array shape (Z,Y,X))
+
+Coast safety:
+  - Uses ESMF/xESMF masking (ocean-only weights) and no extrapolation.
+  - Re-applies target masks after regridding and after vertical interpolation.
+  - Does not perform aggressive filling of coastal NaNs.
+
+Dependencies:
+  - xarray, numpy, xesmf, scipy
+  - dask (optional but recommended for large grids)
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+import xarray as xr
+
+try:
+    import xesmf as xe  # type: ignore
+except Exception as e:  # pragma: no cover
+    xe = None  # type: ignore
+    _XESMF_IMPORT_ERROR = e  # type: ignore
+
+try:
+    from scipy.interpolate import interp1d  # type: ignore
+except Exception as e:  # pragma: no cover
+    interp1d = None  # type: ignore
+    _SCIPY_IMPORT_ERROR = e  # type: ignore
+
+LOG = logging.getLogger("cmems2mitgcm_so")
+
+
+@dataclass(frozen=True)
+class SrcMeta:
+    time_dim: str
+    depth_dim: str
+    lat_dim: str
+    lon_dim: str
+    time_name: str
+    depth_name: str
+    lat_name: str
+    lon_name: str
+
+
+@dataclass(frozen=True)
+class GridMeta:
+    x_dim: str
+    y_dim: str
+    z_dim: str
+    xc_name: str
+    yc_name: str
+    rc_name: str
+    hfac_name: str
+
+
+def configure_logging(verbosity: int) -> None:
+    level = logging.INFO if verbosity <= 0 else logging.DEBUG
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def parse_chunks(chunks_str: Optional[str]) -> Dict[str, int]:
+    """
+    Parse chunk spec like: "depth=10,latitude=64,longitude=128" -> dict
+    """
+    if not chunks_str:
+        return {}
+    out: Dict[str, int] = {}
+    parts = [p.strip() for p in chunks_str.split(",") if p.strip()]
+    for p in parts:
+        if "=" not in p:
+            raise ValueError(f"Invalid --chunks token '{p}'. Use 'dim=int,dim=int'.")
+        k, v = [x.strip() for x in p.split("=", 1)]
+        if not k:
+            raise ValueError(f"Invalid --chunks token '{p}'. Empty dim name.")
+        try:
+            iv = int(v)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --chunks token '{p}'. Chunk must be int.") from exc
+        if iv <= 0:
+            raise ValueError(f"Invalid --chunks token '{p}'. Chunk must be > 0.")
+        out[k] = iv
+    return out
+
+
+def _first_existing(name_candidates: Tuple[str, ...], ds: xr.Dataset) -> Optional[str]:
+    for n in name_candidates:
+        if n in ds.variables or n in ds.coords:
+            return n
+    return None
+
+
+def infer_src_meta(ds: xr.Dataset, varname: str) -> SrcMeta:
+    if varname not in ds.variables:
+        raise KeyError(f"Variable '{varname}' not found in source dataset.")
+
+    da = ds[varname]
+    dims = list(da.dims)
+
+    # Heuristics for common CMEMS naming
+    time_dim = next((d for d in dims if d.lower() in ("time", "time_counter", "t")), None)
+    depth_dim = next((d for d in dims if d.lower() in ("depth", "deptht", "lev", "z", "depthu", "depthv")), None)
+    lat_dim = next((d for d in dims if d.lower() in ("latitude", "lat", "y")), None)
+    lon_dim = next((d for d in dims if d.lower() in ("longitude", "lon", "x")), None)
+
+    if time_dim is None:
+        raise ValueError(f"Cannot infer time dimension for '{varname}'. Dims: {dims}")
+    if depth_dim is None:
+        raise ValueError(f"Cannot infer depth dimension for '{varname}'. Dims: {dims}")
+    if lat_dim is None:
+        raise ValueError(f"Cannot infer latitude dimension for '{varname}'. Dims: {dims}")
+    if lon_dim is None:
+        raise ValueError(f"Cannot infer longitude dimension for '{varname}'. Dims: {dims}")
+
+    time_name = _first_existing((time_dim, "time", "time_counter"), ds) or time_dim
+    depth_name = _first_existing((depth_dim, "depth", "deptht"), ds) or depth_dim
+    lat_name = _first_existing((lat_dim, "latitude", "lat"), ds) or lat_dim
+    lon_name = _first_existing((lon_dim, "longitude", "lon"), ds) or lon_dim
+
+    # Basic coordinate checks
+    for nm in (time_name, depth_name, lat_name, lon_name):
+        if nm not in ds.coords and nm not in ds.variables:
+            raise KeyError(f"Expected coordinate/variable '{nm}' not found in source dataset.")
+
+    return SrcMeta(
+        time_dim=time_dim,
+        depth_dim=depth_dim,
+        lat_dim=lat_dim,
+        lon_dim=lon_dim,
+        time_name=time_name,
+        depth_name=depth_name,
+        lat_name=lat_name,
+        lon_name=lon_name,
+    )
+
+
+def infer_grid_meta(ds: xr.Dataset) -> GridMeta:
+    xc_name = _first_existing(("XC", "xc"), ds)
+    yc_name = _first_existing(("YC", "yc"), ds)
+    rc_name = _first_existing(("RC", "rc"), ds)
+    hfac_name = _first_existing(("HFacC", "hfacC", "hfac", "HFacC"), ds)
+
+    if not xc_name or not yc_name or not rc_name or not hfac_name:
+        raise KeyError(
+            "Grid dataset must contain XC, YC, RC, HFacC (names may differ by case). "
+            f"Found: XC={xc_name}, YC={yc_name}, RC={rc_name}, HFacC={hfac_name}"
+        )
+
+    XC = ds[xc_name]
+    RC = ds[rc_name]
+    HFacC = ds[hfac_name]
+
+    if XC.ndim != 2:
+        raise ValueError(f"{xc_name} must be 2D (Y,X). Got dims {XC.dims}.")
+    if ds[yc_name].ndim != 2:
+        raise ValueError(f"{yc_name} must be 2D (Y,X). Got dims {ds[yc_name].dims}.")
+    if RC.ndim != 1:
+        raise ValueError(f"{rc_name} must be 1D (Z). Got dims {RC.dims}.")
+    if HFacC.ndim != 3:
+        raise ValueError(f"{hfac_name} must be 3D (Z,Y,X). Got dims {HFacC.dims}.")
+
+    y_dim, x_dim = XC.dims
+    z_dim = RC.dims[0]
+
+    # Verify HFacC dims order includes z,y,x
+    if z_dim not in HFacC.dims or y_dim not in HFacC.dims or x_dim not in HFacC.dims:
+        raise ValueError(
+            f"{hfac_name} dims {HFacC.dims} must include (Z={z_dim}, Y={y_dim}, X={x_dim}) as in XC/RC."
+        )
+
+    return GridMeta(
+        x_dim=x_dim,
+        y_dim=y_dim,
+        z_dim=z_dim,
+        xc_name=xc_name,
+        yc_name=yc_name,
+        rc_name=rc_name,
+        hfac_name=hfac_name,
+    )
+
+
+def _normalize_lon_range_1d(lon: xr.DataArray, target_is_0360: bool) -> xr.DataArray:
+    lonv = lon.astype("float64")
+    if target_is_0360:
+        lonv = lonv % 360.0
+    else:
+        lonv = ((lonv + 180.0) % 360.0) - 180.0
+    return lonv
+
+
+def _is_0360(lon_vals: np.ndarray) -> bool:
+    finite = lon_vals[np.isfinite(lon_vals)]
+    if finite.size == 0:
+        return True
+    return (finite.min() >= 0.0) and (finite.max() > 180.0)
+
+
+def _maybe_sort_1d_axis(ds: xr.Dataset, dim: str, coord_name: str) -> xr.Dataset:
+    """
+    Ensure 1D coord along dim is monotonic increasing by sorting the dataset on that coordinate.
+    """
+    coord = ds[coord_name]
+    if coord.ndim != 1 or coord.dims[0] != dim:
+        return ds
+    vals = coord.values
+    if vals.size < 2:
+        return ds
+    if np.all(np.diff(vals) > 0):
+        return ds
+    # sort increasing
+    return ds.sortby(coord_name)
+
+
+def harmonize_lon_lat_src(
+    ds: xr.Dataset,
+    meta: SrcMeta,
+    lon_target_is_0360: bool,
+) -> xr.Dataset:
+    """
+    Normalize source lon range to match target convention and ensure lon/lat are sorted.
+    """
+    lon = ds[meta.lon_name]
+    lat = ds[meta.lat_name]
+
+    if lon.ndim != 1 or lat.ndim != 1:
+        raise ValueError(
+            f"Source lon/lat must be 1D. Got lon {lon.dims} (ndim={lon.ndim}), lat {lat.dims} (ndim={lat.ndim})."
+        )
+
+    lon_norm = _normalize_lon_range_1d(lon, lon_target_is_0360)
+    ds = ds.assign_coords({meta.lon_name: lon_norm})
+    ds = _maybe_sort_1d_axis(ds, meta.lon_dim, meta.lon_name)
+    ds = _maybe_sort_1d_axis(ds, meta.lat_dim, meta.lat_name)
+    return ds
+
+
+def harmonize_lon_dst_2d(lon2d: xr.DataArray, lon_target_is_0360: bool) -> xr.DataArray:
+    lonv = lon2d.astype("float64")
+    if lon_target_is_0360:
+        return lonv % 360.0
+    return ((lonv + 180.0) % 360.0) - 180.0
+
+
+def select_time_index(
+    ds: xr.Dataset,
+    meta: SrcMeta,
+    time_index: Optional[int],
+    time_value: Optional[str],
+) -> Tuple[int, Any]:
+    tcoord = ds[meta.time_name]
+    if tcoord.ndim != 1:
+        raise ValueError(f"Source time coordinate '{meta.time_name}' must be 1D. Got dims {tcoord.dims}.")
+
+    ntime = tcoord.size
+    if time_index is not None:
+        if time_index < 0 or time_index >= ntime:
+            raise IndexError(f"--time-index {time_index} out of range [0, {ntime-1}].")
+        tsel = tcoord.isel({meta.time_dim: time_index}).values
+        return int(time_index), tsel
+
+    if time_value is None:
+        raise ValueError("Either --time-index or --time-value must be provided.")
+
+    try:
+        # Accept YYYY-MM-DD or full ISO strings.
+        dt = datetime.fromisoformat(time_value.replace("Z", "+00:00"))
+    except Exception as exc:
+        raise ValueError(f"Invalid --time-value '{time_value}'. Expected YYYY-MM-DD or ISO datetime.") from exc
+
+    target = np.datetime64(dt)
+    tvals = tcoord.values
+    # If cftime objects, xarray returns object dtype; fallback to xarray indexing
+    if tvals.dtype == object:
+        # Robust fallback: use xarray's sel(method='nearest') if possible
+        try:
+            idx = int(np.argmin(np.abs(xr.DataArray(tcoord).astype("datetime64[ns]").values - target)))
+            tsel = tcoord.isel({meta.time_dim: idx}).values
+            return idx, tsel
+        except Exception:
+            raise ValueError(
+                "Time coordinate appears to be non-numpy datetimes (cftime/object). "
+                "Use --time-index for this dataset."
+            )
+
+    idx = int(np.argmin(np.abs(tvals - target)))
+    tsel = tcoord.isel({meta.time_dim: idx}).values
+    return idx, tsel
+
+
+def load_source(
+    path: str,
+    varname: str,
+    chunks: Dict[str, int],
+    time_index: Optional[int],
+    time_value: Optional[str],
+) -> Tuple[xr.Dataset, xr.DataArray, SrcMeta, int, Any]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Source file not found: {path}")
+
+    ds = xr.open_dataset(path, chunks=chunks or None, decode_times=True, mask_and_scale=True)
+    meta = infer_src_meta(ds, varname)
+    idx, tsel = select_time_index(ds, meta, time_index, time_value)
+
+    da = ds[varname].isel({meta.time_dim: idx}).drop_vars(meta.time_name, errors="ignore")
+    # Ensure we keep the time value for output but drop time dim for computation
+    if meta.time_dim in da.dims:
+        da = da.isel({meta.time_dim: 0})
+
+    # Keep NaNs as missing; ensure float dtype
+    if not np.issubdtype(da.dtype, np.floating):
+        da = da.astype("float32")
+
+    return ds, da, meta, idx, tsel
+
+
+def load_grid(path: str, chunks: Dict[str, int]) -> Tuple[xr.Dataset, GridMeta]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Grid file not found: {path}")
+    ds = xr.open_dataset(path, chunks=chunks or None, decode_times=False, mask_and_scale=True)
+    meta = infer_grid_meta(ds)
+    return ds, meta
+
+
+def build_regridder(
+    grid_src: xr.Dataset,
+    grid_dst: xr.Dataset,
+    method: str,
+    weights_path: str,
+    reuse_weights: bool,
+    periodic: bool,
+) -> Any:
+    if xe is None:  # pragma: no cover
+        raise ImportError(
+            "xesmf is required but could not be imported. "
+            f"Original error: {_XESMF_IMPORT_ERROR}"
+        )
+
+    kwargs: Dict[str, Any] = dict(
+        method=method,
+        filename=weights_path,
+        reuse_weights=reuse_weights,
+        periodic=periodic,
+    )
+
+    # Prefer coast-safe behavior: no extrapolation and NaN for unmapped points.
+    # Some xESMF versions support these kwargs; fall back gracefully if not.
+    for extra in (
+        {"extrap_method": None},
+        {"unmapped_to_nan": True},
+        {"ignore_degenerate": True},
+    ):
+        kwargs.update(extra)
+
+    try:
+        return xe.Regridder(grid_src, grid_dst, **kwargs)
+    except TypeError:
+        # Older versions: remove newer kwargs
+        for k in ("unmapped_to_nan", "ignore_degenerate", "extrap_method"):
+            kwargs.pop(k, None)
+        return xe.Regridder(grid_src, grid_dst, **kwargs)
+
+
+def make_grids_for_xesmf(
+    da_src: xr.DataArray,
+    src_meta: SrcMeta,
+    ds_grid: xr.Dataset,
+    grid_meta: GridMeta,
+) -> Tuple[xr.DataArray, xr.Dataset, xr.Dataset, bool]:
+    """
+    Returns:
+      - da_src (possibly sorted/normalized lon/lat)
+      - grid_src dataset with lon(lat), lat(lat), mask(lat,lon)
+      - grid_dst dataset with lon(Y,X), lat(Y,X), mask(Y,X)
+      - periodic flag
+    """
+    # Determine lon conventions from raw values
+    src_lon = da_src[src_meta.lon_name].values
+    dst_lon_raw = ds_grid[grid_meta.xc_name].values
+    src_is_0360 = _is_0360(np.asarray(src_lon))
+    dst_is_0360 = _is_0360(np.asarray(dst_lon_raw))
+    lon_target_is_0360 = src_is_0360 or dst_is_0360
+
+    LOG.info("Longitude convention: src_is_0_360=%s, dst_is_0_360=%s -> using target_is_0_360=%s",
+             src_is_0360, dst_is_0360, lon_target_is_0360)
+
+    # Normalize source coords (and sort axes)
+    ds_src_tmp = da_src.to_dataset(name="_tmpvar")
+    ds_src_tmp = harmonize_lon_lat_src(ds_src_tmp, src_meta, lon_target_is_0360)
+    da_src = ds_src_tmp["_tmpvar"]
+
+    lon1d = ds_src_tmp[src_meta.lon_name].astype("float64")
+    lat1d = ds_src_tmp[src_meta.lat_name].astype("float64")
+
+    # Normalize destination lon 2D
+    XC = ds_grid[grid_meta.xc_name]
+    YC = ds_grid[grid_meta.yc_name]
+    lon2d = harmonize_lon_dst_2d(XC, lon_target_is_0360)
+    lat2d = YC.astype("float64")
+
+    # Source ocean mask: surface level validity (fast); fallback to any-depth if too sparse.
+    depth_dim = src_meta.depth_dim
+    surf = da_src.isel({depth_dim: 0})
+    mask_src = np.isfinite(surf)
+    wet_frac = float(mask_src.mean().compute() if hasattr(mask_src.data, "compute") else mask_src.mean().item())
+    if wet_frac < 0.01:
+        LOG.warning("Surface-based source mask is very sparse (wet fraction ~%.4f). Falling back to any-depth mask.", wet_frac)
+        mask_src = np.isfinite(da_src).any(dim=depth_dim)
+
+    # Destination ocean mask: surface wet cells from HFacC at top k=0
+    HFacC = ds_grid[grid_meta.hfac_name]
+    mask_dst = (HFacC.isel({grid_meta.z_dim: 0}) > 0.0)
+
+    # xESMF expects mask as 1=valid, 0=masked
+    mask_src_i = mask_src.astype("int8")
+    mask_dst_i = mask_dst.astype("int8")
+
+    grid_src = xr.Dataset(
+        data_vars=dict(mask=(("lat", "lon"), mask_src_i.data)),
+        coords=dict(
+            lon=(("lon",), lon1d.data),
+            lat=(("lat",), lat1d.data),
+        ),
+    )
+
+    grid_dst = xr.Dataset(
+        data_vars=dict(mask=(("Y", "X"), mask_dst_i.data)),
+        coords=dict(
+            lon=(("Y", "X"), lon2d.data),
+            lat=(("Y", "X"), lat2d.data),
+        ),
+    )
+
+    # Heuristic periodic: global src grid and target near dateline seam
+    lon_range = float(np.nanmax(lon1d.values) - np.nanmin(lon1d.values))
+    periodic = bool(lon_range > 350.0)
+    return da_src, grid_src, grid_dst, periodic
+
+
+def horiz_regrid(
+    da_src: xr.DataArray,
+    src_meta: SrcMeta,
+    regridder: Any,
+) -> xr.DataArray:
+    """
+    Horizontal regrid via xESMF.
+    Input dims: (depth, lat, lon)
+    Output dims: (depth, Y, X) (as per grid_dst mask dims)
+    """
+    # Ensure standard names for xESMF: spatial dims are the last two; it preserves other dims.
+    # xESMF will interpret based on grid datasets passed to Regridder.
+    t0 = time.perf_counter()
+    da_out = regridder(da_src)
+    LOG.info("Horizontal regridding completed in %.2f s", time.perf_counter() - t0)
+    return da_out
+
+
+def vert_interp(
+    da_in: xr.DataArray,
+    depth_src: xr.DataArray,
+    depth_tgt: xr.DataArray,
+    out_z_dim: str = "Z",
+) -> xr.DataArray:
+    """
+    Vertical interpolation (positive-down) using scipy.interpolate.interp1d along axis 0.
+
+    da_in dims: (D, Y, X) where D corresponds to depth_src.
+    output dims: (Z, Y, X) where Z corresponds to depth_tgt.
+    """
+    if interp1d is None:  # pragma: no cover
+        raise ImportError(
+            "scipy is required but could not be imported. "
+            f"Original error: {_SCIPY_IMPORT_ERROR}"
+        )
+
+    if depth_src.ndim != 1:
+        raise ValueError("depth_src must be 1D.")
+    if depth_tgt.ndim != 1:
+        raise ValueError("depth_tgt must be 1D.")
+
+    x = np.asarray(depth_src.values, dtype="float64")
+    if not np.all(np.isfinite(x)):
+        raise ValueError("Source depth contains non-finite values.")
+    if np.any(np.diff(x) <= 0):
+        raise ValueError("Source depth must be strictly increasing (monotonic).")
+
+    z = np.asarray(depth_tgt.values, dtype="float64")
+
+    t0 = time.perf_counter()
+    data = da_in.data
+
+    # Prefer blockwise parallelization if dask-backed
+    try:
+        import dask.array as dsa  # type: ignore
+    except Exception:
+        dsa = None  # type: ignore
+
+    if dsa is not None and isinstance(data, dsa.Array):
+        # Ensure full depth in one chunk for axis=0 interpolation
+        if len(data.chunks[0]) != 1:
+            data = data.rechunk({0: data.shape[0]})
+
+        def _interp_block(block: np.ndarray) -> np.ndarray:
+            f = interp1d(
+                x,
+                block,
+                axis=0,
+                bounds_error=False,
+                fill_value=np.nan,
+                assume_sorted=True,
+            )
+            out = f(z).astype("float32", copy=False)
+            return out
+
+        out_chunks = (len(z),) + data.chunks[1:]
+        out = dsa.map_blocks(_interp_block, data, dtype=np.float32, chunks=out_chunks)
+        da_out = xr.DataArray(
+            out,
+            dims=(out_z_dim,) + da_in.dims[1:],
+            coords={out_z_dim: depth_tgt.values, **{d: da_in.coords[d].values for d in da_in.dims[1:] if d in da_in.coords}},
+            name=da_in.name,
+            attrs=dict(da_in.attrs),
+        )
+    else:
+        arr = np.asarray(data)
+        f = interp1d(
+            x,
+            arr,
+            axis=0,
+            bounds_error=False,
+            fill_value=np.nan,
+            assume_sorted=True,
+        )
+        out = f(z).astype("float32", copy=False)
+        da_out = xr.DataArray(
+            out,
+            dims=(out_z_dim,) + da_in.dims[1:],
+            coords={out_z_dim: depth_tgt.values, **{d: da_in.coords[d].values for d in da_in.dims[1:] if d in da_in.coords}},
+            name=da_in.name,
+            attrs=dict(da_in.attrs),
+        )
+
+    LOG.info("Vertical interpolation completed in %.2f s", time.perf_counter() - t0)
+    return da_out
+
+
+def apply_target_masks(
+    da: xr.DataArray,
+    HFacC: xr.DataArray,
+    z_dim: str,
+    y_dim: str,
+    x_dim: str,
+) -> xr.DataArray:
+    """
+    Enforce:
+      - HFacC == 0 => NaN (all levels)
+      - Basic QC check (post-condition)
+    """
+    if set((z_dim, y_dim, x_dim)) - set(HFacC.dims):
+        raise ValueError(f"HFacC dims {HFacC.dims} missing one of required dims {(z_dim, y_dim, x_dim)}.")
+
+    # Align da to (Z,Y,X)
+    da = da.transpose(z_dim, y_dim, x_dim)
+
+    masked = da.where(HFacC > 0.0)
+
+    # QC: after masking, no finite values where HFacC==0
+    bad = xr.where(HFacC == 0.0, np.isfinite(masked), False).any()
+    try:
+        bad_val = bool(bad.compute().item())
+    except Exception:
+        bad_val = bool(bad.item())
+    if bad_val:
+        LOG.warning("QC failed: found finite values on land (HFacC==0). Re-applying mask.")
+        masked = masked.where(HFacC > 0.0)
+
+    return masked
+
+
+def write_netcdf(
+    out_path: str,
+    varname: str,
+    da: xr.DataArray,
+    time_value: Any,
+    ds_grid: xr.Dataset,
+    grid_meta: GridMeta,
+    units: str,
+    standard_name: str,
+    long_name: str,
+) -> None:
+    t0 = time.perf_counter()
+
+    # Ensure dims are (Z,Y,X)
+    da = da.transpose(grid_meta.z_dim, grid_meta.y_dim, grid_meta.x_dim)
+
+    # Build output dataset
+    # Time as a length-1 dimension
+    time_da = xr.DataArray([time_value], dims=("time",), name="time")
+    out = xr.Dataset()
+
+    out["time"] = time_da
+
+    # Coordinates/vars from grid
+    out[grid_meta.xc_name] = ds_grid[grid_meta.xc_name]
+    out[grid_meta.yc_name] = ds_grid[grid_meta.yc_name]
+    out[grid_meta.rc_name] = ds_grid[grid_meta.rc_name]
+
+    # Provide positive-down depth coordinate too (useful in post-processing)
+    depth_tgt = (-ds_grid[grid_meta.rc_name]).astype("float64")
+    depth_tgt.name = "depth"
+    depth_tgt.attrs = {"long_name": "Depth", "units": "m", "positive": "down", "standard_name": "depth"}
+    out["depth"] = depth_tgt
+
+    # Add the variable
+    v = da.astype("float32", copy=False).expand_dims(time=("time",))
+    v.name = varname
+    v.attrs = {
+        "standard_name": standard_name,
+        "long_name": long_name,
+        "units": units,
+        "coordinates": f"{grid_meta.xc_name} {grid_meta.yc_name} {grid_meta.rc_name}",
+    }
+    out[varname] = v
+
+    # Minimal global attributes
+    out.attrs = {
+        "title": "CMEMS -> MITgcm regridded salinity (single time slice)",
+        "history": f"Created {datetime.utcnow().isoformat()}Z by cmems2mitgcm_so",
+        "Conventions": "CF-1.8",
+    }
+
+    # Encoding: keep light compression; set fill value
+    encoding: Dict[str, Dict[str, Any]] = {
+        varname: {"zlib": True, "complevel": 1, "_FillValue": np.float32(1.0e20)},
+        "time": {"zlib": False},
+    }
+
+    out.to_netcdf(out_path, encoding=encoding)
+    LOG.info("Wrote NetCDF: %s (%.2f s)", out_path, time.perf_counter() - t0)
+
+
+def write_mitgcm_bin(
+    out_path: str,
+    da: xr.DataArray,
+    HFacC: xr.DataArray,
+    z_dim: str,
+    y_dim: str,
+    x_dim: str,
+    land_value: float,
+    replace_all_nan: bool,
+) -> None:
+    """
+    Write big-endian float32 binary with order i-fast -> j -> k.
+    Default policy:
+      - set land (HFacC==0) to land_value
+      - keep ocean NaNs as NaN unless replace_all_nan=True (MITgcm generally cannot handle NaNs)
+    """
+    t0 = time.perf_counter()
+    da = da.transpose(z_dim, y_dim, x_dim)
+
+    # Compute to numpy (binary requires concrete array)
+    # Use boolean land mask to avoid float HFacC overhead
+    land_mask = (HFacC == 0.0).transpose(z_dim, y_dim, x_dim)
+    if hasattr(land_mask.data, "compute"):
+        land_np = land_mask.data.compute()
+    else:
+        land_np = np.asarray(land_mask.data)
+    land_np = np.asarray(land_np, dtype=bool)
+
+    if hasattr(da.data, "compute"):
+        data_np = da.data.compute()
+    else:
+        data_np = np.asarray(da.data)
+    data_np = np.asarray(data_np, dtype=np.float32)
+
+    # Apply land policy
+    data_np[land_np] = np.float32(land_value)
+
+    if replace_all_nan:
+        nan_mask = ~np.isfinite(data_np)
+        if nan_mask.any():
+            LOG.warning("Replacing %d NaNs (including ocean) in binary output with land_value=%.6g",
+                        int(nan_mask.sum()), land_value)
+            data_np[nan_mask] = np.float32(land_value)
+    else:
+        # Warn if remaining NaNs exist in ocean
+        ocean_nan = (~np.isfinite(data_np)) & (~land_np)
+        if ocean_nan.any():
+            LOG.warning(
+                "Binary output still contains %d NaNs in ocean cells (HFacC>0). "
+                "MITgcm may not accept NaNs; consider --bin-replace-all-nan.",
+                int(ocean_nan.sum()),
+            )
+
+    # Ensure contiguous, write big-endian
+    data_np = np.ascontiguousarray(data_np)
+    data_be = data_np.astype(">f4", copy=False)
+    with open(out_path, "wb") as f:
+        data_be.tofile(f)
+
+    LOG.info("Wrote MITgcm binary: %s (%.2f s)", out_path, time.perf_counter() - t0)
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="cmems2mitgcm_so",
+        description="Interpolate CMEMS salinity (so) to MITgcm curvilinear grid for a single time slice.",
+    )
+    p.add_argument("--src", required=True, help="Source CMEMS NetCDF file")
+    p.add_argument("--grid", required=True, help="Target MITgcm grid NetCDF (must contain XC, YC, RC, HFacC)")
+    p.add_argument("--var", default="so", help="Source variable name (default: so)")
+
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--time-index", type=int, help="Time index (0..time-1)")
+    g.add_argument("--time-value", type=str, help="ISO date/time (YYYY-MM-DD or ISO); selects nearest time")
+
+    p.add_argument("--out-nc", required=True, help="Output NetCDF path")
+    p.add_argument("--out-bin", required=True, help="Output MITgcm binary path")
+
+    p.add_argument("--weights", required=True, help="xESMF weights cache file (NetCDF)")
+    p.add_argument("--reuse-weights", action="store_true", help="Reuse existing weights file if present")
+
+    p.add_argument("--chunks", default=None, help="Optional chunking spec: 'dim=int,dim=int'")
+
+    p.add_argument("--method", default="bilinear", choices=("bilinear", "nearest_s2d", "nearest_d2s"),
+                   help="xESMF regridding method (default: bilinear). Note: nearest may be less smooth near coasts.")
+    p.add_argument("--bin-land-value", type=float, default=0.0,
+                   help="Value written on land (HFacC==0) in MITgcm binary (default: 0.0)")
+    p.add_argument("--bin-replace-all-nan", action="store_true",
+                   help="Replace all NaNs (including ocean) with --bin-land-value in binary output")
+
+    p.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (repeat for more)")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_argparser().parse_args(argv)
+    configure_logging(args.verbose)
+
+    if xe is None:  # pragma: no cover
+        LOG.error("xesmf import failed: %s", _XESMF_IMPORT_ERROR)
+        return 2
+    if interp1d is None:  # pragma: no cover
+        LOG.error("scipy import failed: %s", _SCIPY_IMPORT_ERROR)
+        return 2
+
+    chunks = {}
+    try:
+        chunks = parse_chunks(args.chunks)
+    except Exception as exc:
+        LOG.error("Invalid --chunks: %s", exc)
+        return 2
+
+    t_all = time.perf_counter()
+
+    try:
+        LOG.info("Loading grid: %s", args.grid)
+        ds_grid, grid_meta = load_grid(args.grid, chunks)
+        XC = ds_grid[grid_meta.xc_name]
+        YC = ds_grid[grid_meta.yc_name]
+        RC = ds_grid[grid_meta.rc_name]
+        HFacC = ds_grid[grid_meta.hfac_name].transpose(grid_meta.z_dim, grid_meta.y_dim, grid_meta.x_dim)
+
+        LOG.info("Loading source: %s", args.src)
+        ds_src, da_src, src_meta, tidx, tval = load_source(
+            args.src, args.var, chunks, args.time_index, args.time_value
+        )
+        LOG.info("Selected time: index=%d, value=%s", tidx, str(tval))
+
+        # Build xESMF grids and regridder
+        LOG.info("Preparing grids and masks for xESMF")
+        da_src, grid_src, grid_dst, periodic = make_grids_for_xesmf(
+            da_src, src_meta, ds_grid, grid_meta
+        )
+
+        # Ensure depth is positive-down and increasing
+        depth_src = ds_src[src_meta.depth_name]
+        if depth_src.ndim != 1:
+            raise ValueError(f"Source depth '{src_meta.depth_name}' must be 1D. Got dims {depth_src.dims}.")
+        depth_src_v = np.asarray(depth_src.values, dtype="float64")
+        if not np.all(np.isfinite(depth_src_v)):
+            raise ValueError("Source depth contains non-finite values.")
+        if np.any(np.diff(depth_src_v) <= 0):
+            raise ValueError("Source depth must be strictly increasing (positive down).")
+
+        # MITgcm target depth: positive down
+        depth_tgt = (-RC).astype("float64")
+        depth_tgt.name = "Z"
+
+        # Weights reuse logic
+        reuse_weights = bool(args.reuse_weights and os.path.exists(args.weights))
+        if args.reuse_weights and not os.path.exists(args.weights):
+            LOG.info("Weights file not found; will create: %s", args.weights)
+        elif reuse_weights:
+            LOG.info("Reusing weights: %s", args.weights)
+
+        LOG.info("Building xESMF regridder (method=%s, periodic=%s)", args.method, periodic)
+        regridder = build_regridder(
+            grid_src=grid_src,
+            grid_dst=grid_dst,
+            method=args.method,
+            weights_path=args.weights,
+            reuse_weights=reuse_weights,
+            periodic=periodic,
+        )
+
+        # Horizontal regrid for all depths (vectorized)
+        LOG.info("Horizontal regridding on all source depths")
+        # Ensure da_src dims order: (depth, lat, lon)
+        da_src = da_src.transpose(src_meta.depth_dim, src_meta.lat_dim, src_meta.lon_dim)
+        so_h = horiz_regrid(da_src, src_meta, regridder)
+
+        # Apply 2D destination mask immediately (surface wet points), to reduce coastal artifacts early
+        LOG.info("Applying 2D destination ocean mask after horizontal regrid")
+        mask_dst_2d = (HFacC.isel({grid_meta.z_dim: 0}) > 0.0).transpose(grid_meta.y_dim, grid_meta.x_dim)
+        so_h = so_h.where(mask_dst_2d)
+
+        # Vertical interpolation: source depth -> target depth (Z)
+        LOG.info("Vertical interpolation (depth -> RC)")
+        # so_h dims should be (depth, Y, X) but dim names may differ; standardize
+        # Identify destination spatial dims from output of xESMF
+        # xESMF uses grid_dst dims ("Y","X") as defined in make_grids_for_xesmf
+        if so_h.ndim != 3:
+            raise ValueError(f"Unexpected horiz output ndim={so_h.ndim}, dims={so_h.dims}. Expected 3D (depth,Y,X).")
+        so_h = so_h.rename({so_h.dims[0]: src_meta.depth_dim, so_h.dims[1]: grid_meta.y_dim, so_h.dims[2]: grid_meta.x_dim})
+        so_v = vert_interp(
+            da_in=so_h,
+            depth_src=depth_src,
+            depth_tgt=depth_tgt,
+            out_z_dim=grid_meta.z_dim,
+        )
+
+        # Apply HFacC mask (3D, partial cells)
+        LOG.info("Applying HFacC (3D) mask and QC")
+        so_masked = apply_target_masks(so_v, HFacC, grid_meta.z_dim, grid_meta.y_dim, grid_meta.x_dim)
+
+        # Prepare attrs
+        src_units = str(ds_src[args.var].attrs.get("units", "1e-3"))
+        std_name = str(ds_src[args.var].attrs.get("standard_name", "sea_water_salinity"))
+        long_name = str(ds_src[args.var].attrs.get("long_name", "Sea water salinity"))
+
+        # Outputs
+        LOG.info("Writing outputs")
+        write_netcdf(
+            out_path=args.out_nc,
+            varname=args.var,
+            da=so_masked,
+            time_value=tval,
+            ds_grid=ds_grid,
+            grid_meta=grid_meta,
+            units=src_units,
+            standard_name=std_name,
+            long_name=long_name,
+        )
+
+        write_mitgcm_bin(
+            out_path=args.out_bin,
+            da=so_masked,
+            HFacC=HFacC,
+            z_dim=grid_meta.z_dim,
+            y_dim=grid_meta.y_dim,
+            x_dim=grid_meta.x_dim,
+            land_value=float(args.bin_land_value),
+            replace_all_nan=bool(args.bin_replace_all_nan),
+        )
+
+        LOG.info("Done. Total wall time: %.2f s", time.perf_counter() - t_all)
+        return 0
+
+    except Exception as exc:
+        LOG.exception("Fatal error: %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
