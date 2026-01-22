@@ -1148,6 +1148,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         log_data_range("Interpolated data after masking", so_masked, mask=(HFacC > 0.0))
 
+        log_data_range("Salinity before NetCDF write", so_masked, mask=(HFacC > 0.0))
+
         
         # Prepare attrs
         src_units = str(ds_src[args.var].attrs.get("units", "1e-3"))
