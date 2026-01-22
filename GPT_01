@@ -340,6 +340,62 @@ def _ensure_depth_increasing(
     raise ValueError("Source depth must be strictly monotonic (increasing or decreasing).")
 
 
+def _derive_target_depth(rc: xr.DataArray) -> xr.DataArray:
+    """
+    Convert MITgcm RC (typically negative, positive-up) to positive-down target depth.
+    Ensures strictly increasing depth axis.
+    """
+    if rc.ndim != 1:
+        raise ValueError(f"Target RC '{rc.name}' must be 1D. Got dims {rc.dims}.")
+    rc_vals = np.asarray(rc.values, dtype="float64")
+    if not np.all(np.isfinite(rc_vals)):
+        raise ValueError("Target RC contains non-finite values.")
+
+    if np.all(rc_vals <= 0):
+        depth_vals = -rc_vals
+    elif np.all(rc_vals >= 0):
+        depth_vals = rc_vals
+    else:
+        raise ValueError("Target RC must be all non-positive or all non-negative.")
+
+    diffs = np.diff(depth_vals)
+    if np.all(diffs > 0):
+        depth = xr.DataArray(depth_vals, dims=rc.dims, coords=rc.coords, name=rc.name)
+        return depth
+    if np.all(diffs < 0):
+        LOG.info("Target depth is decreasing; reversing to be increasing.")
+        depth_vals = depth_vals[::-1]
+        depth = xr.DataArray(depth_vals, dims=rc.dims, coords=rc.coords, name=rc.name)
+        return depth
+    raise ValueError("Target depth must be strictly monotonic (increasing or decreasing).")
+
+
+def _validate_depth_overlap(depth_src: xr.DataArray, depth_tgt: xr.DataArray) -> None:
+    """
+    Validate that source and target depths overlap; warn if target extends beyond source.
+    """
+    src_min = float(np.nanmin(depth_src.values))
+    src_max = float(np.nanmax(depth_src.values))
+    tgt_min = float(np.nanmin(depth_tgt.values))
+    tgt_max = float(np.nanmax(depth_tgt.values))
+
+    if tgt_max < src_min or tgt_min > src_max:
+        raise ValueError(
+            f"No overlap between source depth range [{src_min}, {src_max}] "
+            f"and target depth range [{tgt_min}, {tgt_max}]."
+        )
+
+    if tgt_min < src_min or tgt_max > src_max:
+        LOG.warning(
+            "Target depth range [%s, %s] exceeds source range [%s, %s]; "
+            "values outside source range will be NaN.",
+            tgt_min,
+            tgt_max,
+            src_min,
+            src_max,
+        )
+
+
 def _standardize_regrid_output(
     da: xr.DataArray,
     depth_dim: str,
