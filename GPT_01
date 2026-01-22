@@ -1043,6 +1043,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Apply 2D destination mask immediately (surface wet points), to reduce coastal artifacts early
         LOG.info("Applying 2D destination ocean mask after horizontal regrid")
         mask_dst_2d = (HFacC.isel({grid_meta.z_dim: 0}) > 0.0).transpose(grid_meta.y_dim, grid_meta.x_dim)
+        # Drop coordinates to avoid alignment mismatches with xESMF output (which can lead to all-NaN masking).
+        mask_dst_2d = mask_dst_2d.reset_coords(drop=True)
         so_h = so_h.where(mask_dst_2d)
 
         # Vertical interpolation: source depth -> target depth (Z)
