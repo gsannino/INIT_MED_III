@@ -1,4 +1,4 @@
-```python
+
 #!/usr/bin/env python3
 """
 CMEMS -> MITgcm salinity (so) regridding for a single time slice.
@@ -946,4 +946,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-```
