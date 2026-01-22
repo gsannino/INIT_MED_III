@@ -31,7 +31,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -232,8 +232,12 @@ def _maybe_sort_1d_axis(ds: xr.Dataset, dim: str, coord_name: str) -> xr.Dataset
         return ds
     if np.all(np.diff(vals) > 0):
         return ds
-    # sort increasing
-    return ds.sortby(coord_name)
+    if np.all(np.diff(vals) < 0):
+        return ds.sortby(coord_name)
+    raise ValueError(
+        f"Coordinate '{coord_name}' along dim '{dim}' is not monotonic. "
+        "Please sort or regrid the source dataset before using this tool."
+    )
 
 
 def harmonize_lon_lat_src(
@@ -310,6 +314,95 @@ def select_time_index(
     idx = int(np.argmin(np.abs(tvals - target)))
     tsel = tcoord.isel({meta.time_dim: idx}).values
     return idx, tsel
+
+
+def _ensure_depth_increasing(
+    depth: xr.DataArray,
+    da: xr.DataArray,
+    depth_dim: str,
+) -> Tuple[xr.DataArray, xr.DataArray]:
+    """
+    Ensure depth is strictly increasing (positive-down). If decreasing, reverse depth and data.
+    """
+    if depth.ndim != 1:
+        raise ValueError(f"Source depth '{depth.name}' must be 1D. Got dims {depth.dims}.")
+    depth_vals = np.asarray(depth.values, dtype="float64")
+    if not np.all(np.isfinite(depth_vals)):
+        raise ValueError("Source depth contains non-finite values.")
+    diffs = np.diff(depth_vals)
+    if np.all(diffs > 0):
+        return depth, da
+    if np.all(diffs < 0):
+        LOG.info("Source depth is decreasing; reversing depth axis to be increasing.")
+        depth_rev = depth[::-1]
+        da_rev = da.isel({depth_dim: slice(None, None, -1)})
+        return depth_rev, da_rev
+    raise ValueError("Source depth must be strictly monotonic (increasing or decreasing).")
+
+
+def _standardize_regrid_output(
+    da: xr.DataArray,
+    depth_dim: str,
+    y_dim: str,
+    x_dim: str,
+) -> xr.DataArray:
+    """
+    Ensure regridded output uses expected dim names and ordering (depth, Y, X).
+    """
+    if da.ndim != 3:
+        raise ValueError(f"Unexpected horiz output ndim={da.ndim}, dims={da.dims}. Expected 3D (depth,Y,X).")
+
+    dims = list(da.dims)
+    if depth_dim not in dims:
+        depth_dim = dims[0]
+    if y_dim not in dims or x_dim not in dims:
+        if dims[-2:] != [y_dim, x_dim]:
+            LOG.warning("Regridded dims %s do not match expected (%s,%s); attempting rename by position.",
+                        dims, y_dim, x_dim)
+        da = da.rename({dims[-2]: y_dim, dims[-1]: x_dim})
+    da = da.rename({dims[0]: depth_dim})
+    return da.transpose(depth_dim, y_dim, x_dim)
+
+
+def _derive_target_depth(RC: xr.DataArray) -> xr.DataArray:
+    """
+    Return positive-down depth coordinate derived from RC, handling sign convention.
+    """
+    rc_vals = np.asarray(RC.values, dtype="float64")
+    if not np.all(np.isfinite(rc_vals)):
+        raise ValueError("Target RC contains non-finite values.")
+    if np.all(rc_vals <= 0.0):
+        depth_tgt = (-RC).astype("float64")
+    elif np.all(rc_vals >= 0.0):
+        depth_tgt = RC.astype("float64")
+    else:
+        raise ValueError("Target RC contains mixed sign values; cannot infer depth sign convention.")
+    depth_tgt.name = "Z"
+    return depth_tgt
+
+
+def _validate_depth_overlap(depth_src: xr.DataArray, depth_tgt: xr.DataArray) -> None:
+    """
+    Ensure source and target depth ranges overlap; warn if target exceeds source range.
+    """
+    src_vals = np.asarray(depth_src.values, dtype="float64")
+    tgt_vals = np.asarray(depth_tgt.values, dtype="float64")
+    src_min, src_max = float(np.min(src_vals)), float(np.max(src_vals))
+    tgt_min, tgt_max = float(np.min(tgt_vals)), float(np.max(tgt_vals))
+    if tgt_max < src_min or tgt_min > src_max:
+        raise ValueError(
+            "Target depth range does not overlap source depth range. "
+            f"source=[{src_min:.3f},{src_max:.3f}], target=[{tgt_min:.3f},{tgt_max:.3f}]"
+        )
+    if tgt_min < src_min or tgt_max > src_max:
+        LOG.warning(
+            "Target depth range exceeds source range; out-of-range values will be NaN. "
+            "source=[%.3f, %.3f], target=[%.3f, %.3f]",
+            src_min,
+            src_max,
+            tgt_min,
+            tgt_max,
+        )
 
 
 def load_source(
@@ -586,17 +679,20 @@ def apply_target_masks(
     # Align da to (Z,Y,X)
     da = da.transpose(z_dim, y_dim, x_dim)
 
-    masked = da.where(HFacC > 0.0)
+    # Avoid coord alignment issues by using raw HFacC data with matching dims
+    hfac_data = xr.DataArray(HFacC.data, dims=HFacC.dims)
+    masked = da.where(hfac_data > 0.0)
 
     # QC: after masking, no finite values where HFacC==0
-    bad = xr.where(HFacC == 0.0, np.isfinite(masked), False).any()
+    masked_finite = xr.DataArray(np.isfinite(masked.data), dims=masked.dims)
+    bad = xr.where(hfac_data == 0.0, masked_finite, False).any()
     try:
         bad_val = bool(bad.compute().item())
     except Exception:
         bad_val = bool(bad.item())
     if bad_val:
         LOG.warning("QC failed: found finite values on land (HFacC==0). Re-applying mask.")
-        masked = masked.where(HFacC > 0.0)
+        masked = masked.where(hfac_data > 0.0)
 
     return masked
 
@@ -608,6 +704,7 @@ def write_netcdf(
     time_value: Any,
     ds_grid: xr.Dataset,
     grid_meta: GridMeta,
+    depth_tgt: xr.DataArray,
     units: str,
     standard_name: str,
     long_name: str,
@@ -630,10 +727,9 @@ def write_netcdf(
     out[grid_meta.rc_name] = ds_grid[grid_meta.rc_name]
 
     # Provide positive-down depth coordinate too (useful in post-processing)
-    depth_tgt = (-ds_grid[grid_meta.rc_name]).astype("float64")
-    depth_tgt.name = "depth"
-    depth_tgt.attrs = {"long_name": "Depth", "units": "m", "positive": "down", "standard_name": "depth"}
-    out["depth"] = depth_tgt
+    depth_pos = depth_tgt.astype("float64").rename("depth")
+    depth_pos.attrs = {"long_name": "Depth", "units": "m", "positive": "down", "standard_name": "depth"}
+    out["depth"] = depth_pos
 
     # Add the variable
     v = da.astype("float32", copy=False).expand_dims(time=("time",))
@@ -649,7 +745,7 @@ def write_netcdf(
     # Minimal global attributes
     out.attrs = {
         "title": "CMEMS -> MITgcm regridded salinity (single time slice)",
-        "history": f"Created {datetime.utcnow().isoformat()}Z by cmems2mitgcm_so",
+        "history": f"Created {datetime.now(timezone.utc).isoformat()} by cmems2mitgcm_so",
         "Conventions": "CF-1.8",
     }
 
@@ -798,18 +894,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
         # Ensure depth is positive-down and increasing
-        depth_src = ds_src[src_meta.depth_name]
-        if depth_src.ndim != 1:
-            raise ValueError(f"Source depth '{src_meta.depth_name}' must be 1D. Got dims {depth_src.dims}.")
-        depth_src_v = np.asarray(depth_src.values, dtype="float64")
-        if not np.all(np.isfinite(depth_src_v)):
-            raise ValueError("Source depth contains non-finite values.")
-        if np.any(np.diff(depth_src_v) <= 0):
-            raise ValueError("Source depth must be strictly increasing (positive down).")
+        depth_src, da_src = _ensure_depth_increasing(
+            ds_src[src_meta.depth_name],
+            da_src,
+            src_meta.depth_dim,
+        )
 
         # MITgcm target depth: positive down
-        depth_tgt = (-RC).astype("float64")
-        depth_tgt.name = "Z"
+        depth_tgt = _derive_target_depth(RC)
+        _validate_depth_overlap(depth_src, depth_tgt)
 
         # Weights reuse logic
         reuse_weights = bool(args.reuse_weights and os.path.exists(args.weights))
@@ -841,12 +934,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # Vertical interpolation: source depth -> target depth (Z)
         LOG.info("Vertical interpolation (depth -> RC)")
-        # so_h dims should be (depth, Y, X) but dim names may differ; standardize
-        # Identify destination spatial dims from output of xESMF
-        # xESMF uses grid_dst dims ("Y","X") as defined in make_grids_for_xesmf
-        if so_h.ndim != 3:
-            raise ValueError(f"Unexpected horiz output ndim={so_h.ndim}, dims={so_h.dims}. Expected 3D (depth,Y,X).")
-        so_h = so_h.rename({so_h.dims[0]: src_meta.depth_dim, so_h.dims[1]: grid_meta.y_dim, so_h.dims[2]: grid_meta.x_dim})
+        # Standardize output dims to (depth, Y, X)
+        so_h = _standardize_regrid_output(so_h, src_meta.depth_dim, grid_meta.y_dim, grid_meta.x_dim)
         so_v = vert_interp(
             da_in=so_h,
             depth_src=depth_src,
@@ -872,6 +961,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             time_value=tval,
             ds_grid=ds_grid,
             grid_meta=grid_meta,
+            depth_tgt=depth_tgt,
             units=src_units,
             standard_name=std_name,
             long_name=long_name,
