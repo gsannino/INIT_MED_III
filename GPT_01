@@ -469,24 +469,43 @@ def _apply_missing_value_mask(da: xr.DataArray) -> xr.DataArray:
         if np.isfinite(mv_float):
             da = da.where(da != mv_float)
 
+    base = da
     valid_min = attrs.get("valid_min")
     valid_max = attrs.get("valid_max")
     valid_range = attrs.get("valid_range")
 
+    def _finite_count(arr: xr.DataArray) -> int:
+        arr = arr.where(np.isfinite(arr))
+        count_da = arr.count()
+        try:
+            return int(count_da.compute().item())
+        except Exception:
+            return int(count_da.item())
+
+    da_valid = da
     try:
         if valid_range is not None and len(valid_range) == 2:
             vmin, vmax = (float(valid_range[0]), float(valid_range[1]))
-            da = da.where((da >= vmin) & (da <= vmax))
+            da_valid = da_valid.where((da_valid >= vmin) & (da_valid <= vmax))
     except (TypeError, ValueError):
         pass
 
     try:
         if valid_min is not None:
-            da = da.where(da >= float(valid_min))
+            da_valid = da_valid.where(da_valid >= float(valid_min))
         if valid_max is not None:
-            da = da.where(da <= float(valid_max))
+            da_valid = da_valid.where(da_valid <= float(valid_max))
     except (TypeError, ValueError):
         pass
+
+    if da_valid is not base:
+        if _finite_count(da_valid) == 0:
+            LOG.warning(
+                "All values masked by valid_min/valid_max/valid_range metadata; ignoring those attributes."
+            )
+            da = base
+        else:
+            da = da_valid
 
     # Safety net: mask absurdly large values that often represent missing data.
     da = da.where(np.abs(da) < 1.0e10)
