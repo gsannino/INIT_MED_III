@@ -667,12 +667,14 @@ def vert_interp(
     depth_src: xr.DataArray,
     depth_tgt: xr.DataArray,
     out_z_dim: str = "Z",
+    out_z_coords: Optional[np.ndarray] = None,
 ) -> xr.DataArray:
     """
     Vertical interpolation (positive-down) using scipy.interpolate.interp1d along axis 0.
 
     da_in dims: (D, Y, X) where D corresponds to depth_src.
-    output dims: (Z, Y, X) where Z corresponds to depth_tgt.
+    output dims: (Z, Y, X) where Z corresponds to depth_tgt. Optionally, output
+    Z coords can be set via out_z_coords to match target grid indexing.
     """
     if interp1d is None:  # pragma: no cover
         raise ImportError(
@@ -703,6 +705,7 @@ def vert_interp(
         dsa = None  # type: ignore
 
     if dsa is not None and isinstance(data, dsa.Array):
+        z_coords = depth_tgt.values if out_z_coords is None else out_z_coords
         # Ensure full depth in one chunk for axis=0 interpolation
         if len(data.chunks[0]) != 1:
             data = data.rechunk({0: data.shape[0]})
@@ -724,12 +727,13 @@ def vert_interp(
         da_out = xr.DataArray(
             out,
             dims=(out_z_dim,) + da_in.dims[1:],
-            coords={out_z_dim: depth_tgt.values, **{d: da_in.coords[d].values for d in da_in.dims[1:] if d in da_in.coords}},
+            coords={out_z_dim: z_coords, **{d: da_in.coords[d].values for d in da_in.dims[1:] if d in da_in.coords}},
             name=da_in.name,
             attrs=dict(da_in.attrs),
         )
     else:
         arr = np.asarray(data)
+        z_coords = depth_tgt.values if out_z_coords is None else out_z_coords
         f = interp1d(
             x,
             arr,
@@ -742,7 +746,7 @@ def vert_interp(
         da_out = xr.DataArray(
             out,
             dims=(out_z_dim,) + da_in.dims[1:],
-            coords={out_z_dim: depth_tgt.values, **{d: da_in.coords[d].values for d in da_in.dims[1:] if d in da_in.coords}},
+            coords={out_z_dim: z_coords, **{d: da_in.coords[d].values for d in da_in.dims[1:] if d in da_in.coords}},
             name=da_in.name,
             attrs=dict(da_in.attrs),
         )
@@ -766,23 +770,25 @@ def apply_target_masks(
     if set((z_dim, y_dim, x_dim)) - set(HFacC.dims):
         raise ValueError(f"HFacC dims {HFacC.dims} missing one of required dims {(z_dim, y_dim, x_dim)}.")
 
-    # Align da to (Z,Y,X)
+    # Align da to (Z,Y,X) and synchronize coords with HFacC to avoid label mismatch.
     da = da.transpose(z_dim, y_dim, x_dim)
+    coords_to_align = {d: HFacC.coords[d] for d in (z_dim, y_dim, x_dim) if d in HFacC.coords}
+    if coords_to_align:
+        da = da.assign_coords(coords_to_align)
 
-    # Avoid coord alignment issues by using raw HFacC data with matching dims
-    hfac_data = xr.DataArray(HFacC.data, dims=HFacC.dims)
-    masked = da.where(hfac_data > 0.0)
+    hfac_mask = (HFacC > 0.0)
+    masked = da.where(hfac_mask)
 
     # QC: after masking, no finite values where HFacC==0
     masked_finite = xr.DataArray(np.isfinite(masked.data), dims=masked.dims)
-    bad = xr.where(hfac_data == 0.0, masked_finite, False).any()
+    bad = xr.where(~hfac_mask, masked_finite, False).any()
     try:
         bad_val = bool(bad.compute().item())
     except Exception:
         bad_val = bool(bad.item())
     if bad_val:
         LOG.warning("QC failed: found finite values on land (HFacC==0). Re-applying mask.")
-        masked = masked.where(hfac_data > 0.0)
+        masked = masked.where(hfac_mask)
 
     return masked
 
@@ -1048,6 +1054,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             depth_src=depth_src,
             depth_tgt=depth_tgt,
             out_z_dim=grid_meta.z_dim,
+            out_z_coords=RC.values,
         )
 
         # Apply HFacC mask (3D, partial cells)
