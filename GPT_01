@@ -638,17 +638,20 @@ def apply_target_masks(
     # Align da to (Z,Y,X)
     da = da.transpose(z_dim, y_dim, x_dim)
 
-    masked = da.where(HFacC > 0.0)
+    # Avoid coord alignment issues by using raw HFacC data with matching dims
+    hfac_data = xr.DataArray(HFacC.data, dims=HFacC.dims)
+    masked = da.where(hfac_data > 0.0)
 
     # QC: after masking, no finite values where HFacC==0
-    bad = xr.where(HFacC == 0.0, np.isfinite(masked), False).any()
+    masked_finite = xr.DataArray(np.isfinite(masked.data), dims=masked.dims)
+    bad = xr.where(hfac_data == 0.0, masked_finite, False).any()
     try:
         bad_val = bool(bad.compute().item())
     except Exception:
         bad_val = bool(bad.item())
     if bad_val:
         LOG.warning("QC failed: found finite values on land (HFacC==0). Re-applying mask.")
-        masked = masked.where(HFacC > 0.0)
+        masked = masked.where(hfac_data > 0.0)
 
     return masked
 
