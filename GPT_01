@@ -542,6 +542,26 @@ def log_data_range(label: str, da: xr.DataArray, mask: Optional[xr.DataArray] = 
         LOG.info("%s: min=%.6g max=%.6g", label, min_val, max_val)
 
 
+def log_nan_summary(label: str, da: xr.DataArray, mask: Optional[xr.DataArray] = None) -> None:
+    """
+    Log total/finite/NaN counts and finite fraction, optionally under a mask.
+    """
+    if mask is not None:
+        da = da.where(mask)
+
+    finite = np.isfinite(da)
+    total = finite.size
+    finite_count = finite.sum()
+    try:
+        finite_val = int(finite_count.compute().item())
+    except Exception:
+        finite_val = int(finite_count.item())
+
+    nan_count = total - finite_val
+    frac = float(finite_val / total) if total else 0.0
+    LOG.info("%s: finite=%d total=%d (%.3f), NaN=%d", label, finite_val, total, frac, nan_count)
+
+
 def load_source(
     path: str,
     varname: str,
@@ -1082,6 +1102,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.src, args.var, chunks, args.time_index, args.time_value
         )
         LOG.info("Selected time: index=%d, value=%s", tidx, str(tval))
+        log_nan_summary("Source salinity (raw)", da_src)
 
         # Build xESMF grids and regridder
         LOG.info("Preparing grids and masks for xESMF")
@@ -1097,6 +1118,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
         log_data_range("Source data before interpolation", da_src)
+        log_nan_summary("Source data before interpolation", da_src)
 
         # MITgcm target depth: positive down
         depth_tgt = _derive_target_depth(RC)
@@ -1124,12 +1146,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Ensure da_src dims order: (depth, lat, lon)
         da_src = da_src.transpose(src_meta.depth_dim, src_meta.lat_dim, src_meta.lon_dim)
         so_h = horiz_regrid(da_src, src_meta, regridder)
+        log_nan_summary("After horizontal regrid (pre-mask)", so_h)
 
         # Apply 2D destination mask immediately (surface wet points), to reduce coastal artifacts early
         LOG.info("Applying 2D destination ocean mask after horizontal regrid")
         mask_dst_2d = (HFacC.isel({grid_meta.z_dim: 0}) > 0.0).transpose(grid_meta.y_dim, grid_meta.x_dim)
         # Apply by position with NumPy broadcasting to avoid coordinate reindexing mismatches.
         so_h = apply_2d_mask_safe(so_h, mask_dst_2d, grid_meta.y_dim, grid_meta.x_dim)
+        log_nan_summary("After 2D mask (surface wet)", so_h)
 
         # Vertical interpolation: source depth -> target depth (Z)
         LOG.info("Vertical interpolation (depth -> RC)")
@@ -1142,10 +1166,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             out_z_dim=grid_meta.z_dim,
             out_z_coords=RC.values,
         )
+        log_nan_summary("After vertical interpolation", so_v)
 
         # Apply HFacC mask (3D, partial cells)
         LOG.info("Applying HFacC (3D) mask and QC")
         so_masked = apply_target_masks(so_v, HFacC, grid_meta.z_dim, grid_meta.y_dim, grid_meta.x_dim)
+        log_nan_summary("After HFacC 3D mask", so_masked)
 
         log_data_range("Interpolated data after masking", so_masked, mask=(HFacC > 0.0))
 
